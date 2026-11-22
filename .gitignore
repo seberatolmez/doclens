@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+.doclens/
+evals/data/
+.env*
+.idea/
