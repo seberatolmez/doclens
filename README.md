@@ -32,6 +32,17 @@ OPENROUTER_API_KEY=... python evals/smoke_eval.py --models <model-a> <model-b>
 
 Results go to `evals/results/`.
 
+### Smoke results (M1: 5 docs, 15 questions)
+
+| model | naive unzip+strip | markitdown | markitdown + images |
+|---|---|---|---|
+| anthropic/claude-haiku-5.5 | 11/15 | 13/15 | **15/15** |
+| deepseek/deepseek-v4-flash-0731 (text-only) | 10/15 | 13/15 | n/a |
+
+- Text conversion alone is only a small win over what an agent improvises. Speaker notes and sheet names are where naive extraction loses.
+- **Facts inside images: 0/2 for every text-only variant, 2/2 once images are attached.** That's the gap doclens targets.
+- 15 questions is a small sample: the naive score moved by one point between identical runs. M5 uses a larger set.
+
 ## License
 
 MIT

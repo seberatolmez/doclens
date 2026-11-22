@@ -11,6 +11,7 @@ Writes evals/results/smoke.json and evals/results/smoke.md.
 """
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -41,25 +42,36 @@ def markitdown_extract(path):
     return MarkItDown(enable_plugins=False).convert_local(str(path)).markdown
 
 
-VARIANTS = {"naive": naive_extract, "markitdown": markitdown_extract}
+def media_images(path):
+    """Embedded images as data URLs: what doclens will save to assets/ for the agent to open."""
+    with zipfile.ZipFile(path) as z:
+        names = sorted(n for n in z.namelist() if re.match(r"^(word|ppt|xl)/media/.+\.(png|jpe?g)$", n, re.I))
+        return [f"data:image/{n.rsplit('.', 1)[1].lower().replace('jpg', 'jpeg')};base64,"
+                + base64.b64encode(z.read(n)).decode() for n in names]
+
+
+VARIANTS = {"naive": naive_extract, "markitdown": markitdown_extract, "md+img": markitdown_extract}
+IMAGE_VARIANTS = {"md+img"}
 
 
 def norm(s):
     return re.sub(r"[^a-z0-9.]", "", s.lower())
 
 
-def ask(model, document, question, key):
+def ask(model, document, question, key, images=()):
+    text = f"<document>\n{document}\n</document>\n\nQuestion: {question}"
+    content = [{"type": "text", "text": text}] + [{"type": "image_url", "image_url": {"url": u}} for u in images]
     r = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers={"Authorization": f"Bearer {key}"},
         json={
             "model": model,
             "temperature": 0,
-            "max_tokens": 100,
+            "max_tokens": 4000,  # reasoning models spend tokens thinking; a low cap returns empty answers
             "usage": {"include": True},
             "messages": [
                 {"role": "system", "content": SYSTEM},
-                {"role": "user", "content": f"<document>\n{document}\n</document>\n\nQuestion: {question}"},
+                {"role": "user", "content": content if images else text},
             ],
         },
         timeout=120,
@@ -67,12 +79,15 @@ def ask(model, document, question, key):
     r.raise_for_status()
     body = r.json()
     usage = body.get("usage", {})
-    return body["choices"][0]["message"]["content"] or "", usage.get("prompt_tokens", 0), usage.get("cost", 0.0)
+    choice = body["choices"][0]
+    return (choice["message"]["content"] or "", usage.get("prompt_tokens", 0), usage.get("cost", 0.0),
+            choice.get("finish_reason"))
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--models", nargs="+", required=True)
+    p.add_argument("--vision", nargs="*", default=[], help="models that also get the md+img variant")
     p.add_argument("--data", default=str(ROOT / "data"))
     args = p.parse_args()
     key = os.environ.get("OPENROUTER_API_KEY")
@@ -82,19 +97,23 @@ def main():
     answers = generate(args.data)
     docs = {a["doc"] for a in answers}
     texts = {(d, v): fn(Path(args.data) / d) for d in docs for v, fn in VARIANTS.items()}
+    images = {d: media_images(Path(args.data) / d) for d in docs}
 
     rows = []
     for model in args.models:
         for v in VARIANTS:
+            if v in IMAGE_VARIANTS and model not in args.vision:
+                continue
             for a in answers:
+                imgs = images[a["doc"]] if v in IMAGE_VARIANTS else ()
                 try:
-                    reply, tokens, cost = ask(model, texts[(a["doc"], v)], a["question"], key)
+                    reply, tokens, cost, finish = ask(model, texts[(a["doc"], v)], a["question"], key, imgs)
                     error = None
                 except requests.RequestException as e:
-                    reply, tokens, cost, error = "", 0, 0.0, str(e)
+                    reply, tokens, cost, finish, error = "", 0, 0.0, None, str(e)
                 ok = norm(a["answer"]) in norm(reply)
                 rows.append({**a, "model": model, "variant": v, "reply": reply, "correct": ok,
-                             "prompt_tokens": tokens, "cost": cost, "error": error})
+                             "prompt_tokens": tokens, "cost": cost, "finish_reason": finish, "error": error})
                 print(f"{model:40} {v:10} {a['id']:22} {'OK ' if ok else 'BAD'} {reply[:60]!r}")
 
     out = ROOT / "results"
@@ -111,6 +130,8 @@ def report(rows):
     for model in dict.fromkeys(r["model"] for r in rows):
         for v in VARIANTS:
             rs = [r for r in rows if r["model"] == model and r["variant"] == v]
+            if not rs:
+                continue
             acc = lambda xs: f"{sum(x['correct'] for x in xs)}/{len(xs)}" if xs else "-"  # noqa: E731
             per_tag = [acc([r for r in rs if r["tag"] == t]) for t in tags]
             avg_tok = sum(r["prompt_tokens"] for r in rs) // max(len(rs), 1)
