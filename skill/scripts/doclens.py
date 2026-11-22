@@ -11,6 +11,7 @@ import argparse
 import base64
 import hashlib
 import io
+import os
 import re
 import sys
 from pathlib import Path
@@ -18,10 +19,13 @@ from pathlib import Path
 FORMAT_VERSION = "1"  # bump when output format changes, so stale cache entries are not reused
 INLINE_LIMIT = 20_000  # chars; above this, print only the path so harness output limits don't truncate
 LARGE_LIMIT = 200_000
-MIN_IMAGE_BYTES = 2_048  # skip icons, bullets, spacer images
+MIN_IMAGE_PX = 64  # drop only images smaller than this on both sides (icons, bullets, tracking pixels); never by byte size, simple charts compress below 2 KB
 SCANNED_CHARS_PER_PAGE = 50
 
-DATA_URI_IMAGE = re.compile(r"!\[([^\]]*)\]\(data:image/([a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)\)")
+# optional markdown title after the data URI: markdownify emits ![alt](data:... "title")
+DATA_URI_IMAGE = re.compile(
+    r'!\[([^\]]*)\]\(data:image/([a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)(?:\s+"(?:[^"\\]|\\.)*")?\)')
+LEFTOVER_DATA_URI = re.compile(r"data:[\w/+.-]+;base64,[A-Za-z0-9+/=]{200,}")  # never let base64 reach the model
 
 
 def file_hash(path):
@@ -32,11 +36,11 @@ def file_hash(path):
     return h.hexdigest()[:12]
 
 
-def image_size(data):
+def image_dims(data):
     try:
-        from PIL import Image  # optional: present with the pptx extra
+        from PIL import Image  # optional: present with the pptx extra; without it nothing is dropped
         with Image.open(io.BytesIO(data)) as im:
-            return f"{im.width}x{im.height} px"
+            return im.width, im.height
     except Exception:
         return None
 
@@ -51,7 +55,8 @@ def extract_images(markdown, assets):
             data = base64.b64decode(re.sub(r"\s", "", b64), validate=True)
         except ValueError:
             return f"![{alt}]()"
-        if len(data) < MIN_IMAGE_BYTES:
+        dims = image_dims(data)
+        if dims and max(dims) < MIN_IMAGE_PX:
             return ""
         ext = {"jpeg": "jpg", "svg+xml": "svg", "x-emf": "emf", "x-wmf": "wmf"}.get(subtype, subtype)
         name = f"img-{hashlib.sha256(data).hexdigest()[:8]}.{ext}"  # content hash also dedupes repeats
@@ -59,10 +64,9 @@ def extract_images(markdown, assets):
             assets.mkdir(parents=True, exist_ok=True)
             (assets / name).write_bytes(data)
             saved.add(name)
-        size = image_size(data)
-        return f"![{alt or 'image'}](assets/{name}" + (f' "{size}"' if size else "") + ")"
+        return f"![{alt or 'image'}](assets/{name}" + (f' "{dims[0]}x{dims[1]} px"' if dims else "") + ")"
 
-    return DATA_URI_IMAGE.sub(repl, markdown)
+    return LEFTOVER_DATA_URI.sub("data:(omitted)", DATA_URI_IMAGE.sub(repl, markdown))
 
 
 def pdf_pages(path):
@@ -78,6 +82,7 @@ def convert(src, out_root):
     """Return (md_path, cached). Raises on conversion failure."""
     from markitdown import MarkItDown
 
+    fresh = not Path(out_root).exists()
     target = Path(out_root) / file_hash(src)
     md_path = target / f"{src.name}.md"
     if md_path.exists():
@@ -89,10 +94,11 @@ def convert(src, out_root):
     # shortcut: xlsx embedded images are not extracted (markitdown never emits them), add via _image_to_html if asked
 
     target.mkdir(parents=True, exist_ok=True)
-    md_path.write_text(md, encoding="utf-8")
-    ignore = Path(out_root) / ".gitignore"
-    if not ignore.exists():
-        ignore.write_text("*\n", encoding="utf-8")  # keep the cache out of the user's repo without touching theirs
+    tmp = md_path.with_name(md_path.name + ".tmp")
+    tmp.write_text(md, encoding="utf-8")
+    os.replace(tmp, md_path)  # the .md is the cache marker, so it must never exist half-written
+    if fresh:  # only a directory we created: --out pointing at the user's own folder must not get a catch-all ignore
+        (Path(out_root) / ".gitignore").write_text("*\n", encoding="utf-8")
     return md_path, False
 
 
@@ -136,4 +142,7 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    # piped Windows stdout defaults to the legacy code page, which crashes on any non-ASCII document text
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
     sys.exit(main())

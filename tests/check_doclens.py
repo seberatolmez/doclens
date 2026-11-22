@@ -3,12 +3,13 @@
 import base64
 import contextlib
 import io
+import subprocess
 import sys
 import tempfile
 import zipfile
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageDraw
 from reportlab.pdfgen import canvas
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,15 +54,42 @@ with tempfile.TemporaryDirectory() as tmp:
     code, out = run(data / "sales.xlsx", "--out", cache)
     assert code == 0 and "## 2025" in out and "| West |" in out, out
 
-    # tiny images (icons) are dropped, repeats deduped
-    tiny = base64.b64encode(b"\x89PNG" + b"0" * 100).decode()
-    buf = io.BytesIO()
-    Image.new("RGB", (300, 200), "red").save(buf, "PNG")
-    big = base64.b64encode(buf.getvalue() + b"\0" * 3000).decode()
-    md = doclens.extract_images(f"![a](data:image/png;base64,{tiny}) ![b](data:image/png;base64,{big}) "
-                                f"![c](data:image/png;base64,{big})", tmp / "a")
+    # icons (by pixels) are dropped, repeats deduped, small-but-real charts kept even when under 2 KB
+    def png_b64(w, h, draw=False):
+        im = Image.new("RGB", (w, h), "white")
+        if draw:
+            ImageDraw.Draw(im).rectangle([20, 20, w - 20, h - 20], fill=(60, 110, 200))
+        buf = io.BytesIO()
+        im.save(buf, "PNG", optimize=True)
+        return buf.getvalue(), base64.b64encode(buf.getvalue()).decode()
+
+    _, icon = png_b64(16, 16)
+    chart_bytes, chart = png_b64(400, 250, draw=True)
+    assert len(chart_bytes) < 2048, "test chart should be smaller than the old byte threshold"
+    md = doclens.extract_images(f"![i](data:image/png;base64,{icon}) ![b](data:image/png;base64,{chart}) "
+                                f"![c](data:image/png;base64,{chart})", tmp / "a")
     assert md.count("](assets/") == 2 and len(list((tmp / "a").iterdir())) == 1, md
-    assert '"300x200 px"' in md
+    assert '"400x250 px"' in md and "![i]" not in md
+
+    # titled data-URI image (html/epub) must not leave base64 behind; unknown data URIs are scrubbed too
+    (tmp / "t.html").write_text(f'<p>x</p><img src="data:image/png;base64,{chart}" alt="chart" title="Rev &quot;Q3&quot;">')
+    code, out = run(tmp / "t.html", "--out", cache)
+    assert code == 0 and "base64" not in out and "![chart](assets/" in out, out[:300]
+    leftover = doclens.extract_images("[doc](data:application/pdf;base64," + "A" * 400 + ")", tmp / "b")
+    assert "AAAA" not in leftover and "data:(omitted)" in leftover, leftover
+
+    # --out pointing at an existing folder must not get a catch-all .gitignore; no temp files left behind
+    mine = tmp / "mine"
+    mine.mkdir()
+    assert run(tmp / "t.html", "--out", mine)[0] == 0
+    assert not (mine / ".gitignore").exists()
+    assert not list(cache.rglob("*.tmp")) and not list(mine.rglob("*.tmp"))
+
+    # non-ASCII text through a pipe (an agent's shell) must not crash on the legacy Windows code page
+    (tmp / "u.html").write_text("<p>Şeker → ğüşiöç 日本語</p>", encoding="utf-8")
+    r = subprocess.run([sys.executable, doclens.__file__, str(tmp / "u.html"), "--out", str(tmp / "cu")],
+                       capture_output=True)
+    assert r.returncode == 0 and "Şeker → ğüşiöç 日本語" in r.stdout.decode("utf-8"), r.stderr.decode(errors="replace")
 
     # text PDF: no warning; scanned (image-only) PDF: warning, also on cache hit
     c = canvas.Canvas(str(tmp / "text.pdf"))
