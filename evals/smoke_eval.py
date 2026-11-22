@@ -3,10 +3,12 @@
 Variants per document:
   naive       - unzip the OOXML and strip tags (what agents typically improvise with zipfile + regex)
   markitdown  - markitdown default output
+  md+img      - markitdown output plus the document's images attached (only for models passed to --vision)
 
 Usage:
   set OPENROUTER_API_KEY=...
-  python evals/smoke_eval.py --models anthropic/claude-sonnet-4.5 meta-llama/llama-3.3-70b-instruct
+  python evals/smoke_eval.py --models anthropic/claude-haiku-5.5 deepseek/deepseek-v4-flash-0731 \
+      --vision anthropic/claude-haiku-5.5
 Writes evals/results/smoke.json and evals/results/smoke.md.
 """
 
@@ -16,6 +18,7 @@ import json
 import os
 import re
 import sys
+import time
 import zipfile
 from pathlib import Path
 
@@ -58,24 +61,34 @@ def norm(s):
     return re.sub(r"[^a-z0-9.]", "", s.lower())
 
 
+def matches(answer, reply):
+    """Whole-token match, so "4" is not found in "14" or "4.7", but "4.7" is found in "$4.7M"."""
+    a = re.escape(re.sub(r"\s+", " ", answer.strip().lower())).replace(r"\ ", r"\s*")
+    pre = r"(?<![\w.])"
+    post = r"(?!\d|\.\d)" if answer.strip()[-1].isdigit() else r"(?![a-z])"
+    return re.search(pre + a + post, re.sub(r"\s+", " ", reply.lower())) is not None
+
+
 def ask(model, document, question, key, images=()):
     text = f"<document>\n{document}\n</document>\n\nQuestion: {question}"
     content = [{"type": "text", "text": text}] + [{"type": "image_url", "image_url": {"url": u}} for u in images]
-    r = requests.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers={"Authorization": f"Bearer {key}"},
-        json={
-            "model": model,
-            "temperature": 0,
-            "max_tokens": 4000,  # reasoning models spend tokens thinking; a low cap returns empty answers
-            "usage": {"include": True},
-            "messages": [
-                {"role": "system", "content": SYSTEM},
-                {"role": "user", "content": content if images else text},
-            ],
-        },
-        timeout=120,
-    )
+    payload = {
+        "model": model,
+        "temperature": 0,
+        "max_tokens": 4000,  # reasoning models spend tokens thinking; a low cap returns empty answers
+        "usage": {"include": True},
+        "messages": [
+            {"role": "system", "content": SYSTEM},
+            {"role": "user", "content": content if images else text},
+        ],
+    }
+    for attempt in range(4):
+        r = requests.post("https://openrouter.ai/api/v1/chat/completions",
+                          headers={"Authorization": f"Bearer {key}"}, json=payload, timeout=120)
+        if r.status_code in (429, 500, 502, 503, 504) and attempt < 3:
+            time.sleep(2 ** attempt)
+            continue
+        break
     r.raise_for_status()
     body = r.json()
     usage = body.get("usage", {})
@@ -111,7 +124,7 @@ def main():
                     error = None
                 except requests.RequestException as e:
                     reply, tokens, cost, finish, error = "", 0, 0.0, None, str(e)
-                ok = norm(a["answer"]) in norm(reply)
+                ok = matches(a["answer"], reply)
                 rows.append({**a, "model": model, "variant": v, "reply": reply, "correct": ok,
                              "prompt_tokens": tokens, "cost": cost, "finish_reason": finish, "error": error})
                 print(f"{model:40} {v:10} {a['id']:22} {'OK ' if ok else 'BAD'} {reply[:60]!r}")
@@ -125,18 +138,20 @@ def main():
 
 def report(rows):
     tags = sorted({r["tag"] for r in rows})
-    lines = ["| model | variant | accuracy | " + " | ".join(tags) + " | avg prompt tokens | cost $ |",
-             "|---|---|---|" + "---|" * len(tags) + "---|---|"]
+    lines = ["| model | variant | accuracy | " + " | ".join(tags) + " | avg prompt tokens | cost $ | failed calls |",
+             "|---|---|---|" + "---|" * len(tags) + "---|---|---|"]
     for model in dict.fromkeys(r["model"] for r in rows):
         for v in VARIANTS:
-            rs = [r for r in rows if r["model"] == model and r["variant"] == v]
-            if not rs:
+            all_rs = [r for r in rows if r["model"] == model and r["variant"] == v]
+            if not all_rs:
                 continue
+            rs = [r for r in all_rs if not r["error"]]  # a failed call says nothing about the model's accuracy
             acc = lambda xs: f"{sum(x['correct'] for x in xs)}/{len(xs)}" if xs else "-"  # noqa: E731
             per_tag = [acc([r for r in rs if r["tag"] == t]) for t in tags]
             avg_tok = sum(r["prompt_tokens"] for r in rs) // max(len(rs), 1)
-            cost = sum(r["cost"] or 0 for r in rs)
-            lines.append(f"| {model} | {v} | {acc(rs)} | " + " | ".join(per_tag) + f" | {avg_tok} | {cost:.4f} |")
+            cost = sum(r["cost"] or 0 for r in all_rs)
+            lines.append(f"| {model} | {v} | {acc(rs)} | " + " | ".join(per_tag)
+                         + f" | {avg_tok} | {cost:.4f} | {len(all_rs) - len(rs)} |")
     return "\n".join(lines) + "\n"
 
 
