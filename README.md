@@ -19,6 +19,22 @@ One portable [agent skill](https://agentskills.io) built on [markitdown](https:/
 - an explicit warning for scanned PDFs instead of empty output
 - thin optional hooks per harness, shipped only where evals show the skill alone doesn't trigger reliably
 
+## Core script
+
+```sh
+python skill/scripts/doclens.py spec.docx
+# spec.docx -> .doclens/bef26fd9228e/spec.docx.md (~101 tokens, 1 images)
+# images: .doclens/bef26fd9228e/assets (open one only when the question needs it)
+# ...markdown printed inline when short...
+```
+
+- Images keep their alt text and position: `![Org chart](assets/img-8f44cd15.png "800x330 px")`
+- Cached by content hash. `.doclens/` ignores itself, so your repo stays clean.
+- Scanned PDFs get a warning instead of silently returning nothing.
+- Local files only (`convert_local`): a path never turns into a URL fetch.
+
+Checks: `python tests/check_doclens.py`
+
 ## Evals first
 
 We only ship what the numbers justify. The eval set is synthetic with exact answers, including facts that exist
